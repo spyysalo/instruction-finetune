@@ -22,7 +22,8 @@ from transformers import (
     DataCollatorForLanguageModeling,
     pipeline,
 )
-
+from transformers.deepspeed import is_deepspeed_zero3_enabled
+from peft import get_peft_config, get_peft_model, LoraConfig, TaskType
 
 # Avoid "huggingface/tokenizers: The current process just got forked" warning
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -39,6 +40,9 @@ def argparser():
     ap.add_argument('--gradient-checkpointing', action='store_true')
     ap.add_argument('--max-train-examples', type=int, default=None)
     ap.add_argument('--max-valid-examples', type=int, default=None)
+    ap.add_argument('--num_train_epochs', type=int, default=1)
+    ap.add_argument('--use_lora', action='store_true', help="train only low-rank-adaptation parameters")
+    ap.add_argument('--output_dir', default="output")
     ap.add_argument('model')
     ap.add_argument('train_data')
     ap.add_argument('valid_data')
@@ -197,6 +201,41 @@ def print_generation(label, model, tokenizer, text=None):
     print(pipe(text, max_new_tokens=25)[0]['generated_text'])
 
 
+# function for noisy average initialization from
+# https://github.com/huggingface/transformers/pull/14709/commits/49e42e74cd54ed2e8d0eefe314ed8dfa33c29ddd
+def get_noisy_avg_embeddings(old_embeddings, samples_needed):
+    old_num_tokens = old_embeddings.weight.size()[0]
+    old_weights = old_embeddings.weight.data
+    mu = torch.mean(old_weights, dim=0)
+    sigma = (old_weights - mu).T @ (old_weights - mu) / old_num_tokens
+    dist = torch.distributions.multivariate_normal.MultivariateNormal(
+        mu, covariance_matrix=sigma
+    )
+    samples = torch.stack(tuple((dist.sample() for _ in range(samples_needed))), dim=0).to(mu.device)
+    return samples
+
+
+def resize_token_embeddings(model, new_size):
+    # adapted from https://github.com/huggingface/transformers/pull/14709/commits/49e42e74cd54ed2e8d0eefe314ed8dfa33c29ddd
+    old_embeddings = model.get_input_embeddings()
+    old_size = old_embeddings.weight.size()[0]
+    if old_size == new_size:
+        return
+    model.resize_token_embeddings(new_size)
+    new_embeddings = model.get_input_embeddings()
+    extra_words = new_size - old_size
+
+    new_emb = get_noisy_avg_embeddings(old_embeddings, extra_words)
+    if not is_deepspeed_zero3_enabled():
+        new_embeddings.weight.data[-extra_words:, :] = new_emb
+    else:
+        import deepspeed
+        with deepspeed.zero.GatheredParameters(
+                old_embeddings.weight, modifier_rank=0):
+            if torch.distributed.get_rank() == 0:
+                new_embeddings.weight.data[-extra_words:, :] = new_emb
+
+
 def main(argv):
     args = argparser().parse_args(argv[1:])
 
@@ -204,6 +243,13 @@ def main(argv):
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(args.model)
+
+    if args.use_lora:
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM, inference_mode=False, r=8, lora_alpha=32, lora_dropout=0.1
+            )
+        model = get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
 
     print_generation('Base model', model, tokenizer)
     
@@ -215,7 +261,7 @@ def main(argv):
         tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
     if tokenizer.sep_token is None:
         tokenizer.add_special_tokens({'sep_token': '<|endofprompt|>'})
-    model.resize_token_embeddings(len(tokenizer))
+    resize_token_embeddings(model, len(tokenizer))
 
     train_data = load_data(args.train_data, args.max_train_examples)
     valid_data = load_data(args.valid_data, args.max_valid_examples)
@@ -240,9 +286,11 @@ def main(argv):
         tokenizer.decode(dataset['train']['input_ids'][0]),
     )
 
+    # 1e-05: FINAL VALIDATION LOSS: 2.250183343887329
+    
     training_args = TrainingArguments(
         learning_rate=args.learning_rate,
-        output_dir='output',
+        output_dir=args.output_dir,
         logging_dir='logs',
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -251,9 +299,9 @@ def main(argv):
         evaluation_strategy='steps',
         logging_strategy='steps',
         weight_decay=0.01,
-        num_train_epochs=1,
+        num_train_epochs=args.num_train_epochs,
         eval_steps=1000,
-        logging_steps=1000,
+        logging_steps=100,
         save_strategy='no',
         #save_total_limit=5,
         #save_steps=1000,
@@ -285,7 +333,10 @@ def main(argv):
     print('GRADIENT ACCUMULATION STEPS:', args.gradient_accumulation_steps)
     print('FINAL VALIDATION LOSS:', valid_results['eval_loss'])
 
-    trainer.save_model('finetuned-model')
+    if args.use_lora:
+        trainer.model.save_pretrained(os.path.join(args.output_dir, "finetuned-model"))
+    else:
+        trainer.save_model(os.path.join(args.output_dir, 'finetuned-model'))
 
     print_generation('Fine-tuned model', model, tokenizer)
     
